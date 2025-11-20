@@ -1,0 +1,1050 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mahoga2
+
+//@version=6
+indicator("日経225先物 - 統計分析システム V3.3 完全版", overlay=true, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════
+// 設定
+// ═══════════════════════════════════════════════════════════
+marketFilter = input.string("全市場", "表示する市場", 
+  options=["全市場", "日本市場(N+T)", "米国市場(S+Q)", "Nのみ", "Tのみ", "Sのみ", "Qのみ"], 
+  group="市場選択")
+showStats = input.bool(true, "統計テーブルを表示", group="表示設定")
+statsPosition = input.string("右上", "統計テーブル位置", options=["右上", "右下", "左上", "左下"], group="表示設定")
+statsMode = input.string("基本統計詳細", "表示モード", 
+  options=["基本統計詳細", "エントリー最適化-全データ", "MA関係別統計", "エントリー最適化-MA関係別"], 
+  group="表示設定")
+minOccurrence = input.int(10, "最小出現回数", minval=1, group="フィルター")
+minWinRate = input.float(0, "最小勝率(%)", minval=0, maxval=100, group="フィルター")
+minPF = input.float(0, "最小PF", minval=0, group="フィルター")
+maxResults = input.int(30, "最大表示数", minval=5, maxval=100, group="フィルター")
+
+optimizeSignal = input.string("N□", "最適化対象シグナル", 
+  options=["N■","N●","N◆","N▼","N↓","N□","N○","N◇","N▲","N↑","N◆◆","N◇◇","N●×","N○×","N↑3","N↑4","N↓3","N↓4",
+           "T■","T●","T◆","T▼","T↓","T□","T○","T◇","T▲","T↑","T◆◆","T◇◇","T●×","T○×","T↑3","T↑4","T↓3","T↓4",
+           "S■","S●","S◆","S▼","S↓","S□","S○","S◇","S▲","S↑","S◆◆","S◇◇","S●×","S○×","S↑3","S↑4","S↓3","S↓4",
+           "Q■","Q●","Q◆","Q▼","Q↓","Q□","Q○","Q◇","Q▲","Q↑","Q◆◆","Q◇◇","Q●×","Q○×","Q↑3","Q↑4","Q↓3","Q↓4"],
+  group="エントリー最適化")
+optimizeMaPattern = input.string("①始>5>25", "MA関係(モード4用)", 
+  options=["①始>5>25", "②始>25>5", "③5>始>25", "④5>25>始", "⑤25>始>5", "⑥25>5>始"],
+  group="エントリー最適化")
+
+// ═══════════════════════════════════════════════════════════
+// ヘルパー関数
+// ═══════════════════════════════════════════════════════════
+f_shouldShowMarket(market) =>
+    (marketFilter == "全市場" or 
+     (marketFilter == "日本市場(N+T)" and (market == "N" or market == "T")) or
+     (marketFilter == "米国市場(S+Q)" and (market == "S" or market == "Q")) or
+     (marketFilter == "Nのみ" and market == "N") or
+     (marketFilter == "Tのみ" and market == "T") or
+     (marketFilter == "Sのみ" and market == "S") or
+     (marketFilter == "Qのみ" and market == "Q"))
+
+f_getInt(m, key) =>
+    val = map.get(m, key)
+    na(val) ? 0 : int(val)
+
+f_getFloat(m, key) =>
+    val = map.get(m, key)
+    na(val) ? 0.0 : float(val)
+
+// ═══════════════════════════════════════════════════════════
+// 移動平均線
+// ═══════════════════════════════════════════════════════════
+ma5 = ta.sma(close, 5)
+ma25 = ta.sma(close, 25)
+
+plot(ma5, "5日線", color=color.new(color.blue, 0), linewidth=2)
+plot(ma25, "25日線", color=color.new(color.red, 0), linewidth=2)
+
+// ═══════════════════════════════════════════════════════════
+// マルチマーケットデータ取得
+// ═══════════════════════════════════════════════════════════
+[nk_open, nk_high, nk_low, nk_close] = request.security("TVC:NI225", timeframe.period, [open, high, low, close], lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+[tp_open, tp_high, tp_low, tp_close] = request.security("TSE:TOPIX", timeframe.period, [open, high, low, close], lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+[sp_open, sp_high, sp_low, sp_close] = request.security("SP:SPX", timeframe.period, [open, high, low, close], lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+[nq_open, nq_high, nq_low, nq_close] = request.security("NASDAQ:NDX", timeframe.period, [open, high, low, close], lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+
+// ═══════════════════════════════════════════════════════════
+// シグナル検出関数
+// ═══════════════════════════════════════════════════════════
+f_detectSignals(o, h, l, c, o1, h1, l1, c1) =>
+    body = math.abs(c - o)
+    upperWick = h - math.max(c, o)
+    lowerWick = math.min(c, o) - l
+    
+    isBullish = c > o
+    isBearish = c < o
+    prevBullish = c1 > o1
+    prevBearish = c1 < o1
+    
+    bodyTop = isBullish ? c : o
+    bodyBottom = isBullish ? o : c
+    prevBodyTop = prevBullish ? c1 : o1
+    prevBodyBottom = prevBullish ? o1 : c1
+    
+    ma5_val = ta.sma(c, 5)
+    
+    spikeHighRaw = upperWick >= body * 3 and body > 0
+    spikeLowRaw = lowerWick >= body * 3 and body > 0
+    spikeHigh = spikeHighRaw and not spikeLowRaw
+    spikeLow = spikeLowRaw and not spikeHighRaw
+    
+    bearishHarami = prevBullish and isBearish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+    bearishEngulfing = prevBullish and isBearish and bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom
+    bullishHarami = prevBearish and isBullish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+    bullishEngulfing = prevBearish and isBullish and bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom
+    
+    bearishBearishHarami = prevBearish and isBearish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+    bullishBullishHarami = prevBullish and isBullish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+    
+    bearishEngulfingRejected = prevBullish and isBearish and o > c1 and h >= h1 and l <= l1 and not (bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom)
+    bullishEngulfingRejected = prevBearish and isBullish and o < c1 and h >= h1 and l <= l1 and not (bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom)
+    
+    longerUpperWick = upperWick > lowerWick
+    longerLowerWick = lowerWick > upperWick
+    
+    wickBelowMa5Rejected = l < ma5_val and c > ma5_val and o > ma5_val
+    wickAboveMa5Rejected = h > ma5_val and c < ma5_val and o < ma5_val
+    
+    [spikeHigh, spikeLow, bearishEngulfing, bullishEngulfing, bearishHarami, bullishHarami, 
+     longerUpperWick, longerLowerWick, wickAboveMa5Rejected, wickBelowMa5Rejected,
+     bearishBearishHarami, bullishBullishHarami, bearishEngulfingRejected, bullishEngulfingRejected]
+
+// ═══════════════════════════════════════════════════════════
+// 各市場のシグナル検出
+// ═══════════════════════════════════════════════════════════
+body = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+
+isBullish = close > open
+isBearish = close < open
+prevBullish = close[1] > open[1]
+prevBearish = close[1] < open[1]
+
+bodyTop = isBullish ? close : open
+bodyBottom = isBullish ? open : close
+prevBodyTop = prevBullish ? close[1] : open[1]
+prevBodyBottom = prevBullish ? open[1] : close[1]
+
+spikeHighRaw = upperWick >= body * 3 and body > 0
+spikeLowRaw = lowerWick >= body * 3 and body > 0
+spikeHigh = spikeHighRaw and not spikeLowRaw
+spikeLow = spikeLowRaw and not spikeHighRaw
+
+bearishHarami = prevBullish and isBearish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+bearishEngulfing = prevBullish and isBearish and bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom
+bullishHarami = prevBearish and isBullish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+bullishEngulfing = prevBearish and isBullish and bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom
+
+bearishBearishHarami = prevBearish and isBearish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+bullishBullishHarami = prevBullish and isBullish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+bearishEngulfingRejected = prevBullish and isBearish and open > close[1] and high >= high[1] and low <= low[1] and not (bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom)
+bullishEngulfingRejected = prevBearish and isBullish and open < close[1] and high >= high[1] and low <= low[1] and not (bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom)
+
+longerUpperWick = upperWick > lowerWick
+longerLowerWick = lowerWick > upperWick
+
+wickBelowMa5Rejected = low < ma5 and close > ma5 and open > ma5
+wickAboveMa5Rejected = high > ma5 and close < ma5 and open < ma5
+
+lowerWick4 = longerLowerWick and longerLowerWick[1] and longerLowerWick[2] and longerLowerWick[3]
+lowerWick3 = longerLowerWick and longerLowerWick[1] and longerLowerWick[2] and not lowerWick4
+upperWick4 = longerUpperWick and longerUpperWick[1] and longerUpperWick[2] and longerUpperWick[3]
+upperWick3 = longerUpperWick and longerUpperWick[1] and longerUpperWick[2] and not upperWick4
+
+[nk_spikeHigh, nk_spikeLow, nk_bearishEng, nk_bullishEng, nk_bearishHar, nk_bullishHar, nk_upperWick, nk_lowerWick, nk_wickAbove, nk_wickBelow, nk_bbHar, nk_bbullHar, nk_bearEngRej, nk_bullEngRej] = f_detectSignals(nk_open, nk_high, nk_low, nk_close, nk_open[1], nk_high[1], nk_low[1], nk_close[1])
+[tp_spikeHigh, tp_spikeLow, tp_bearishEng, tp_bullishEng, tp_bearishHar, tp_bullishHar, tp_upperWick, tp_lowerWick, tp_wickAbove, tp_wickBelow, tp_bbHar, tp_bbullHar, tp_bearEngRej, tp_bullEngRej] = f_detectSignals(tp_open, tp_high, tp_low, tp_close, tp_open[1], tp_high[1], tp_low[1], tp_close[1])
+[sp_spikeHigh, sp_spikeLow, sp_bearishEng, sp_bullishEng, sp_bearishHar, sp_bullishHar, sp_upperWick, sp_lowerWick, sp_wickAbove, sp_wickBelow, sp_bbHar, sp_bbullHar, sp_bearEngRej, sp_bullEngRej] = f_detectSignals(sp_open, sp_high, sp_low, sp_close, sp_open[1], sp_high[1], sp_low[1], sp_close[1])
+[nq_spikeHigh, nq_spikeLow, nq_bearishEng, nq_bullishEng, nq_bearishHar, nq_bullishHar, nq_upperWick, nq_lowerWick, nq_wickAbove, nq_wickBelow, nq_bbHar, nq_bbullHar, nq_bearEngRej, nq_bullEngRej] = f_detectSignals(nq_open, nq_high, nq_low, nq_close, nq_open[1], nq_high[1], nq_low[1], nq_close[1])
+
+nk_lowerWick4 = nk_lowerWick and nk_lowerWick[1] and nk_lowerWick[2] and nk_lowerWick[3]
+nk_lowerWick3 = nk_lowerWick and nk_lowerWick[1] and nk_lowerWick[2] and not nk_lowerWick4
+nk_upperWick4 = nk_upperWick and nk_upperWick[1] and nk_upperWick[2] and nk_upperWick[3]
+nk_upperWick3 = nk_upperWick and nk_upperWick[1] and nk_upperWick[2] and not nk_upperWick4
+
+tp_lowerWick4 = tp_lowerWick and tp_lowerWick[1] and tp_lowerWick[2] and tp_lowerWick[3]
+tp_lowerWick3 = tp_lowerWick and tp_lowerWick[1] and tp_lowerWick[2] and not tp_lowerWick4
+tp_upperWick4 = tp_upperWick and tp_upperWick[1] and tp_upperWick[2] and tp_upperWick[3]
+tp_upperWick3 = tp_upperWick and tp_upperWick[1] and tp_upperWick[2] and not tp_upperWick4
+
+sp_lowerWick4 = sp_lowerWick and sp_lowerWick[1] and sp_lowerWick[2] and sp_lowerWick[3]
+sp_lowerWick3 = sp_lowerWick and sp_lowerWick[1] and sp_lowerWick[2] and not sp_lowerWick4
+sp_upperWick4 = sp_upperWick and sp_upperWick[1] and sp_upperWick[2] and sp_upperWick[3]
+sp_upperWick3 = sp_upperWick and sp_upperWick[1] and sp_upperWick[2] and not sp_upperWick4
+
+nq_lowerWick4 = nq_lowerWick and nq_lowerWick[1] and nq_lowerWick[2] and nq_lowerWick[3]
+nq_lowerWick3 = nq_lowerWick and nq_lowerWick[1] and nq_lowerWick[2] and not nq_lowerWick4
+nq_upperWick4 = nq_upperWick and nq_upperWick[1] and nq_upperWick[2] and nq_upperWick[3]
+nq_upperWick3 = nq_upperWick and nq_upperWick[1] and nq_upperWick[2] and not nq_upperWick4
+
+// ═══════════════════════════════════════════════════════════
+// シグナル文字列生成
+// ═══════════════════════════════════════════════════════════
+f_buildSignalText(marketCode, spikeH, spikeL, bearEng, bullEng, bearHar, bullHar, upperW, lowerW, wickAbove, wickBelow, bbHar, bbullHar, bearEngRej, bullEngRej, lw3, lw4, uw3, uw4) =>
+    upText = ""
+    downText = ""
+    upHasWick = false
+    downHasWick = false
+    
+    if spikeH or bearEng or bearHar or upperW or wickAbove or bbullHar or bullEngRej or uw3 or uw4
+        upText := marketCode
+        if spikeH
+            upText := upText + "■"
+        if bearEng
+            upText := upText + "●"
+        if bearHar
+            upText := upText + "◆"
+        if wickAbove
+            upText := upText + "▼"
+        if bbullHar
+            upText := upText + "◇◇"
+        if bullEngRej
+            upText := upText + "○×"
+        if uw4
+            upText := upText + "↓4"
+        else if uw3
+            upText := upText + "↓3"
+        if upperW and not uw3 and not uw4
+            upHasWick := true
+    
+    if spikeL or bullEng or bullHar or lowerW or wickBelow or bbHar or bearEngRej or lw3 or lw4
+        downText := marketCode
+        if spikeL
+            downText := downText + "□"
+        if bullEng
+            downText := downText + "○"
+        if bullHar
+            downText := downText + "◇"
+        if wickBelow
+            downText := downText + "▲"
+        if bbHar
+            downText := downText + "◆◆"
+        if bearEngRej
+            downText := downText + "●×"
+        if lw4
+            downText := downText + "↑4"
+        else if lw3
+            downText := downText + "↑3"
+        if lowerW and not lw3 and not lw4
+            downHasWick := true
+    
+    [upText, downText, upHasWick, downHasWick]
+
+[nk_upText, nk_downText, nk_upWick, nk_downWick] = f_buildSignalText("N", nk_spikeHigh, nk_spikeLow, nk_bearishEng, nk_bullishEng, nk_bearishHar, nk_bullishHar, nk_upperWick, nk_lowerWick, nk_wickAbove, nk_wickBelow, nk_bbHar, nk_bbullHar, nk_bearEngRej, nk_bullEngRej, nk_lowerWick3, nk_lowerWick4, nk_upperWick3, nk_upperWick4)
+[tp_upText, tp_downText, tp_upWick, tp_downWick] = f_buildSignalText("T", tp_spikeHigh, tp_spikeLow, tp_bearishEng, tp_bullishEng, tp_bearishHar, tp_bullishHar, tp_upperWick, tp_lowerWick, tp_wickAbove, tp_wickBelow, tp_bbHar, tp_bbullHar, tp_bearEngRej, tp_bullEngRej, tp_lowerWick3, tp_lowerWick4, tp_upperWick3, tp_upperWick4)
+[sp_upText, sp_downText, sp_upWick, sp_downWick] = f_buildSignalText("S", sp_spikeHigh, sp_spikeLow, sp_bearishEng, sp_bullishEng, sp_bearishHar, sp_bullishHar, sp_upperWick, sp_lowerWick, sp_wickAbove, sp_wickBelow, sp_bbHar, sp_bbullHar, sp_bearEngRej, sp_bullEngRej, sp_lowerWick3, sp_lowerWick4, sp_upperWick3, sp_upperWick4)
+[nq_upText, nq_downText, nq_upWick, nq_downWick] = f_buildSignalText("Q", nq_spikeHigh, nq_spikeLow, nq_bearishEng, nq_bullishEng, nq_bearishHar, nq_bullishHar, nq_upperWick, nq_lowerWick, nq_wickAbove, nq_wickBelow, nq_bbHar, nq_bbullHar, nq_bearEngRej, nq_bullEngRej, nq_lowerWick3, nq_lowerWick4, nq_upperWick3, nq_upperWick4)
+
+// ═══════════════════════════════════════════════════════════
+// 統計変数
+// ═══════════════════════════════════════════════════════════
+var map<string, int> stat_count = map.new<string, int>()
+var map<string, int> stat_o0h_cnt = map.new<string, int>()
+var map<string, int> stat_o0h_win = map.new<string, int>()
+var map<string, float> stat_o0h_profit = map.new<string, float>()
+var map<string, float> stat_o0h_loss = map.new<string, float>()
+var map<string, int> stat_o0l_cnt = map.new<string, int>()
+var map<string, int> stat_o0l_win = map.new<string, int>()
+var map<string, float> stat_o0l_profit = map.new<string, float>()
+var map<string, float> stat_o0l_loss = map.new<string, float>()
+var map<string, int> stat_o0c_cnt = map.new<string, int>()
+var map<string, int> stat_o0c_win = map.new<string, int>()
+var map<string, float> stat_o0c_profit = map.new<string, float>()
+var map<string, float> stat_o0c_loss = map.new<string, float>()
+var map<string, int> stat_o1c_cnt = map.new<string, int>()
+var map<string, int> stat_o1c_win = map.new<string, int>()
+var map<string, float> stat_o1c_profit = map.new<string, float>()
+var map<string, float> stat_o1c_loss = map.new<string, float>()
+var map<string, int> stat_o2c_cnt = map.new<string, int>()
+var map<string, int> stat_o2c_win = map.new<string, int>()
+var map<string, float> stat_o2c_profit = map.new<string, float>()
+var map<string, float> stat_o2c_loss = map.new<string, float>()
+var map<string, int> stat_ma_count = map.new<string, int>()
+var map<string, int> stat_ma_o0c_cnt = map.new<string, int>()
+var map<string, int> stat_ma_o0c_win = map.new<string, int>()
+var map<string, float> stat_ma_o0c_profit = map.new<string, float>()
+var map<string, float> stat_ma_o0c_loss = map.new<string, float>()
+var map<string, int> stat_ma_o1c_cnt = map.new<string, int>()
+var map<string, int> stat_ma_o1c_win = map.new<string, int>()
+var map<string, float> stat_ma_o1c_profit = map.new<string, float>()
+var map<string, float> stat_ma_o1c_loss = map.new<string, float>()
+var map<string, int> stat_ma_o2c_cnt = map.new<string, int>()
+var map<string, int> stat_ma_o2c_win = map.new<string, int>()
+var map<string, float> stat_ma_o2c_profit = map.new<string, float>()
+var map<string, float> stat_ma_o2c_loss = map.new<string, float>()
+var array<float> opt_priceChanges = array.new<float>()
+var array<string> opt_signals = array.new<string>()
+var array<string> opt_maPatterns = array.new<string>()
+var array<float> opt_entryOpen = array.new<float>()
+var array<float> opt_day0High = array.new<float>()
+var array<float> opt_day0Low = array.new<float>()
+var array<float> opt_day0Close = array.new<float>()
+var array<float> opt_day1Close = array.new<float>()
+var array<bool> opt_isBearish = array.new<bool>()
+
+// ═══════════════════════════════════════════════════════════
+// MA関係判定関数
+// ═══════════════════════════════════════════════════════════
+f_getMaPattern(entryOpen, ma5Val, ma25Val) =>
+    pattern = ""
+    if entryOpen > ma5Val and ma5Val > ma25Val
+        pattern := "①始>5>25"
+    else if entryOpen > ma25Val and ma25Val > ma5Val
+        pattern := "②始>25>5"
+    else if ma5Val > entryOpen and entryOpen > ma25Val
+        pattern := "③5>始>25"
+    else if ma5Val > ma25Val and ma25Val > entryOpen
+        pattern := "④5>25>始"
+    else if ma25Val > entryOpen and entryOpen > ma5Val
+        pattern := "⑤25>始>5"
+    else if ma25Val > ma5Val and ma5Val > entryOpen
+        pattern := "⑥25>5>始"
+    pattern
+
+// ═══════════════════════════════════════════════════════════
+// 統計記録関数
+// ═══════════════════════════════════════════════════════════
+f_recordStats(sigName, isBearish, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5Val, ma25Val) =>
+    if not na(entryOpen) and not na(day0Close) and not na(day1Close) and not na(day2Close)
+        map.put(stat_count, sigName, f_getInt(stat_count, sigName) + 1)
+        
+        ret_o0h = (day0High - entryOpen) / entryOpen * 100
+        isWin_o0h = (isBearish and ret_o0h < 0) or (not isBearish and ret_o0h > 0)
+        map.put(stat_o0h_cnt, sigName, f_getInt(stat_o0h_cnt, sigName) + 1)
+        map.put(stat_o0h_win, sigName, f_getInt(stat_o0h_win, sigName) + (isWin_o0h ? 1 : 0))
+        map.put(stat_o0h_profit, sigName, f_getFloat(stat_o0h_profit, sigName) + (isWin_o0h ? math.abs(ret_o0h) : 0))
+        map.put(stat_o0h_loss, sigName, f_getFloat(stat_o0h_loss, sigName) + (isWin_o0h ? 0 : math.abs(ret_o0h)))
+        
+        ret_o0l = (day0Low - entryOpen) / entryOpen * 100
+        isWin_o0l = (isBearish and ret_o0l < 0) or (not isBearish and ret_o0l > 0)
+        map.put(stat_o0l_cnt, sigName, f_getInt(stat_o0l_cnt, sigName) + 1)
+        map.put(stat_o0l_win, sigName, f_getInt(stat_o0l_win, sigName) + (isWin_o0l ? 1 : 0))
+        map.put(stat_o0l_profit, sigName, f_getFloat(stat_o0l_profit, sigName) + (isWin_o0l ? math.abs(ret_o0l) : 0))
+        map.put(stat_o0l_loss, sigName, f_getFloat(stat_o0l_loss, sigName) + (isWin_o0l ? 0 : math.abs(ret_o0l)))
+        
+        ret_o0c = (day0Close - entryOpen) / entryOpen * 100
+        isWin_o0c = (isBearish and ret_o0c < 0) or (not isBearish and ret_o0c > 0)
+        map.put(stat_o0c_cnt, sigName, f_getInt(stat_o0c_cnt, sigName) + 1)
+        map.put(stat_o0c_win, sigName, f_getInt(stat_o0c_win, sigName) + (isWin_o0c ? 1 : 0))
+        map.put(stat_o0c_profit, sigName, f_getFloat(stat_o0c_profit, sigName) + (isWin_o0c ? math.abs(ret_o0c) : 0))
+        map.put(stat_o0c_loss, sigName, f_getFloat(stat_o0c_loss, sigName) + (isWin_o0c ? 0 : math.abs(ret_o0c)))
+        
+        ret_o1c = (day1Close - entryOpen) / entryOpen * 100
+        isWin_o1c = (isBearish and ret_o1c < 0) or (not isBearish and ret_o1c > 0)
+        map.put(stat_o1c_cnt, sigName, f_getInt(stat_o1c_cnt, sigName) + 1)
+        map.put(stat_o1c_win, sigName, f_getInt(stat_o1c_win, sigName) + (isWin_o1c ? 1 : 0))
+        map.put(stat_o1c_profit, sigName, f_getFloat(stat_o1c_profit, sigName) + (isWin_o1c ? math.abs(ret_o1c) : 0))
+        map.put(stat_o1c_loss, sigName, f_getFloat(stat_o1c_loss, sigName) + (isWin_o1c ? 0 : math.abs(ret_o1c)))
+        
+        ret_o2c = (day2Close - entryOpen) / entryOpen * 100
+        isWin_o2c = (isBearish and ret_o2c < 0) or (not isBearish and ret_o2c > 0)
+        map.put(stat_o2c_cnt, sigName, f_getInt(stat_o2c_cnt, sigName) + 1)
+        map.put(stat_o2c_win, sigName, f_getInt(stat_o2c_win, sigName) + (isWin_o2c ? 1 : 0))
+        map.put(stat_o2c_profit, sigName, f_getFloat(stat_o2c_profit, sigName) + (isWin_o2c ? math.abs(ret_o2c) : 0))
+        map.put(stat_o2c_loss, sigName, f_getFloat(stat_o2c_loss, sigName) + (isWin_o2c ? 0 : math.abs(ret_o2c)))
+        
+        maPattern = f_getMaPattern(entryOpen, ma5Val, ma25Val)
+        if maPattern != ""
+            maKey = sigName + "_" + maPattern
+            map.put(stat_ma_count, maKey, f_getInt(stat_ma_count, maKey) + 1)
+            map.put(stat_ma_o0c_cnt, maKey, f_getInt(stat_ma_o0c_cnt, maKey) + 1)
+            map.put(stat_ma_o0c_win, maKey, f_getInt(stat_ma_o0c_win, maKey) + (isWin_o0c ? 1 : 0))
+            map.put(stat_ma_o0c_profit, maKey, f_getFloat(stat_ma_o0c_profit, maKey) + (isWin_o0c ? math.abs(ret_o0c) : 0))
+            map.put(stat_ma_o0c_loss, maKey, f_getFloat(stat_ma_o0c_loss, maKey) + (isWin_o0c ? 0 : math.abs(ret_o0c)))
+            map.put(stat_ma_o1c_cnt, maKey, f_getInt(stat_ma_o1c_cnt, maKey) + 1)
+            map.put(stat_ma_o1c_win, maKey, f_getInt(stat_ma_o1c_win, maKey) + (isWin_o1c ? 1 : 0))
+            map.put(stat_ma_o1c_profit, maKey, f_getFloat(stat_ma_o1c_profit, maKey) + (isWin_o1c ? math.abs(ret_o1c) : 0))
+            map.put(stat_ma_o1c_loss, maKey, f_getFloat(stat_ma_o1c_loss, maKey) + (isWin_o1c ? 0 : math.abs(ret_o1c)))
+            map.put(stat_ma_o2c_cnt, maKey, f_getInt(stat_ma_o2c_cnt, maKey) + 1)
+            map.put(stat_ma_o2c_win, maKey, f_getInt(stat_ma_o2c_win, maKey) + (isWin_o2c ? 1 : 0))
+            map.put(stat_ma_o2c_profit, maKey, f_getFloat(stat_ma_o2c_profit, maKey) + (isWin_o2c ? math.abs(ret_o2c) : 0))
+            map.put(stat_ma_o2c_loss, maKey, f_getFloat(stat_ma_o2c_loss, maKey) + (isWin_o2c ? 0 : math.abs(ret_o2c)))
+        
+        priceChange = isBearish ? (day0Low - entryOpen) / entryOpen : (day0High - entryOpen) / entryOpen
+        array.push(opt_priceChanges, priceChange)
+        array.push(opt_signals, sigName)
+        array.push(opt_maPatterns, maPattern)
+        array.push(opt_entryOpen, entryOpen)
+        array.push(opt_day0High, day0High)
+        array.push(opt_day0Low, day0Low)
+        array.push(opt_day0Close, day0Close)
+        array.push(opt_day1Close, day1Close)
+        array.push(opt_isBearish, isBearish)
+
+// ═══════════════════════════════════════════════════════════
+// 【解決】市場別シグナル記録関数 (ifブロックを短縮)
+// ═══════════════════════════════════════════════════════════
+f_recordNikkeiSignals(entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry) =>
+    if nk_spikeHigh[3]
+        f_recordStats("N■", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_bearishEng[3]
+        f_recordStats("N●", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_bearishHar[3]
+        f_recordStats("N◆", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_wickAbove[3]
+        f_recordStats("N▼", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_upperWick[3]
+        f_recordStats("N↓", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_spikeLow[3]
+        f_recordStats("N□", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_bullishEng[3]
+        f_recordStats("N○", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_bullishHar[3]
+        f_recordStats("N◇", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_wickBelow[3]
+        f_recordStats("N▲", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_lowerWick[3]
+        f_recordStats("N↑", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_bbHar[3]
+        f_recordStats("N◆◆", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_bbullHar[3]
+        f_recordStats("N◇◇", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_bearEngRej[3]
+        f_recordStats("N●×", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_bullEngRej[3]
+        f_recordStats("N○×", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_lowerWick3[3]
+        f_recordStats("N↑3", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_lowerWick4[3]
+        f_recordStats("N↑4", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_upperWick3[3]
+        f_recordStats("N↓3", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nk_upperWick4[3]
+        f_recordStats("N↓4", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+
+f_recordTopixSignals(entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry) =>
+    if tp_spikeHigh[3]
+        f_recordStats("T■", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_bearishEng[3]
+        f_recordStats("T●", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_bearishHar[3]
+        f_recordStats("T◆", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_wickAbove[3]
+        f_recordStats("T▼", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_upperWick[3]
+        f_recordStats("T↓", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_spikeLow[3]
+        f_recordStats("T□", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_bullishEng[3]
+        f_recordStats("T○", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_bullishHar[3]
+        f_recordStats("T◇", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_wickBelow[3]
+        f_recordStats("T▲", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_lowerWick[3]
+        f_recordStats("T↑", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_bbHar[3]
+        f_recordStats("T◆◆", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_bbullHar[3]
+        f_recordStats("T◇◇", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_bearEngRej[3]
+        f_recordStats("T●×", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_bullEngRej[3]
+        f_recordStats("T○×", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_lowerWick3[3]
+        f_recordStats("T↑3", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_lowerWick4[3]
+        f_recordStats("T↑4", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_upperWick3[3]
+        f_recordStats("T↓3", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if tp_upperWick4[3]
+        f_recordStats("T↓4", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+
+f_recordSP500Signals(entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry) =>
+    if sp_spikeHigh[3]
+        f_recordStats("S■", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_bearishEng[3]
+        f_recordStats("S●", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_bearishHar[3]
+        f_recordStats("S◆", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_wickAbove[3]
+        f_recordStats("S▼", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_upperWick[3]
+        f_recordStats("S↓", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_spikeLow[3]
+        f_recordStats("S□", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_bullishEng[3]
+        f_recordStats("S○", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_bullishHar[3]
+        f_recordStats("S◇", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_wickBelow[3]
+        f_recordStats("S▲", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_lowerWick[3]
+        f_recordStats("S↑", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_bbHar[3]
+        f_recordStats("S◆◆", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_bbullHar[3]
+        f_recordStats("S◇◇", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_bearEngRej[3]
+        f_recordStats("S●×", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_bullEngRej[3]
+        f_recordStats("S○×", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_lowerWick3[3]
+        f_recordStats("S↑3", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_lowerWick4[3]
+        f_recordStats("S↑4", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_upperWick3[3]
+        f_recordStats("S↓3", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if sp_upperWick4[3]
+        f_recordStats("S↓4", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+
+f_recordNasdaqSignals(entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry) =>
+    if nq_spikeHigh[3]
+        f_recordStats("Q■", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_bearishEng[3]
+        f_recordStats("Q●", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_bearishHar[3]
+        f_recordStats("Q◆", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_wickAbove[3]
+        f_recordStats("Q▼", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_upperWick[3]
+        f_recordStats("Q↓", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_spikeLow[3]
+        f_recordStats("Q□", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_bullishEng[3]
+        f_recordStats("Q○", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_bullishHar[3]
+        f_recordStats("Q◇", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_wickBelow[3]
+        f_recordStats("Q▲", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_lowerWick[3]
+        f_recordStats("Q↑", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_bbHar[3]
+        f_recordStats("Q◆◆", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_bbullHar[3]
+        f_recordStats("Q◇◇", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_bearEngRej[3]
+        f_recordStats("Q●×", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_bullEngRej[3]
+        f_recordStats("Q○×", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_lowerWick3[3]
+        f_recordStats("Q↑3", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_lowerWick4[3]
+        f_recordStats("Q↑4", false, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_upperWick3[3]
+        f_recordStats("Q↓3", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    if nq_upperWick4[3]
+        f_recordStats("Q↓4", true, entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+
+// ═══════════════════════════════════════════════════════════
+// 【短縮されたifブロック】全市場のシグナル記録
+// ═══════════════════════════════════════════════════════════
+if bar_index > 3
+    entryOpen = open[2]
+    day0High = high[2]
+    day0Low = low[2]
+    day0Close = close[2]
+    day1Close = close[1]
+    day2Close = close
+    ma5_entry = ma5[2]
+    ma25_entry = ma25[2]
+    
+    f_recordNikkeiSignals(entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    f_recordTopixSignals(entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    f_recordSP500Signals(entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+    f_recordNasdaqSignals(entryOpen, day0High, day0Low, day0Close, day1Close, day2Close, ma5_entry, ma25_entry)
+
+
+// チャート表示
+atr = ta.atr(14)
+offsetUnit = atr * 0.3
+
+upCounter = 0
+if spikeHigh
+    label.new(bar_index, high + offsetUnit * upCounter, "📉スパイクハイ", style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+    upCounter += 1
+if bearishHarami
+    label.new(bar_index, high + offsetUnit * upCounter, "🔴陽の陰はらみ", style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
+    upCounter += 1
+if bearishEngulfing
+    label.new(bar_index, high + offsetUnit * upCounter, "⚫陰の包み線", style=label.style_label_down, color=color.new(#8B0000, 20), textcolor=color.white, size=size.tiny)
+    upCounter += 1
+if bullishBullishHarami
+    label.new(bar_index, high + offsetUnit * upCounter, "🟡陽の陽はらみ", style=label.style_label_down, color=color.new(color.yellow, 20), textcolor=color.black, size=size.tiny)
+    upCounter += 1
+if bullishEngulfingRejected
+    label.new(bar_index, high + offsetUnit * upCounter, "🔵○×否定", style=label.style_label_down, color=color.new(color.blue, 20), textcolor=color.white, size=size.tiny)
+    upCounter += 1
+if upperWick4
+    label.new(bar_index, high + offsetUnit * upCounter, "⬇️4連", style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white, size=size.tiny)
+    upCounter += 1
+else if upperWick3
+    label.new(bar_index, high + offsetUnit * upCounter, "⬇️3連", style=label.style_label_down, color=color.new(color.red, 30), textcolor=color.white, size=size.tiny)
+    upCounter += 1
+if longerUpperWick and not spikeHigh and not upperWick3 and not upperWick4
+    label.new(bar_index, high + offsetUnit * upCounter, "↓", style=label.style_label_down, color=color.new(color.red, 70), textcolor=color.red, size=size.tiny)
+    upCounter += 1
+if wickAboveMa5Rejected
+    label.new(bar_index, high + offsetUnit * upCounter, "✗上抜け否定", style=label.style_label_down, color=color.new(color.purple, 30), textcolor=color.white, size=size.tiny)
+    upCounter += 1
+
+marketUpCounter = upCounter
+if nk_upText != "" and f_shouldShowMarket("N")
+    label.new(bar_index, high + offsetUnit * marketUpCounter, nk_upText, style=label.style_label_down, color=color.new(color.gray, 50), textcolor=nk_upWick ? color.red : color.white, size=size.tiny)
+    marketUpCounter += 1
+if tp_upText != "" and f_shouldShowMarket("T")
+    label.new(bar_index, high + offsetUnit * marketUpCounter, tp_upText, style=label.style_label_down, color=color.new(color.gray, 50), textcolor=tp_upWick ? color.red : color.white, size=size.tiny)
+    marketUpCounter += 1
+if sp_upText != "" and f_shouldShowMarket("S")
+    label.new(bar_index, high + offsetUnit * marketUpCounter, sp_upText, style=label.style_label_down, color=color.new(color.gray, 50), textcolor=sp_upWick ? color.red : color.white, size=size.tiny)
+    marketUpCounter += 1
+if nq_upText != "" and f_shouldShowMarket("Q")
+    label.new(bar_index, high + offsetUnit * marketUpCounter, nq_upText, style=label.style_label_down, color=color.new(color.gray, 50), textcolor=nq_upWick ? color.red : color.white, size=size.tiny)
+    marketUpCounter += 1
+
+downCounter = 0
+if spikeLow
+    label.new(bar_index, low - offsetUnit * downCounter, "📈スパイクロー", style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+    downCounter += 1
+if bullishHarami
+    label.new(bar_index, low - offsetUnit * downCounter, "🟢陰の陽はらみ", style=label.style_label_up, color=color.new(color.lime, 20), textcolor=color.white, size=size.tiny)
+    downCounter += 1
+if bullishEngulfing
+    label.new(bar_index, low - offsetUnit * downCounter, "⚪陰の包み陽線", style=label.style_label_up, color=color.new(#006400, 20), textcolor=color.white, size=size.tiny)
+    downCounter += 1
+if bearishBearishHarami
+    label.new(bar_index, low - offsetUnit * downCounter, "🟤陰の陰はらみ", style=label.style_label_up, color=color.new(color.maroon, 20), textcolor=color.white, size=size.tiny)
+    downCounter += 1
+if bearishEngulfingRejected
+    label.new(bar_index, low - offsetUnit * downCounter, "🟣●×否定", style=label.style_label_up, color=color.new(color.purple, 20), textcolor=color.white, size=size.tiny)
+    downCounter += 1
+if lowerWick4
+    label.new(bar_index, low - offsetUnit * downCounter, "⬆️4連", style=label.style_label_up, color=color.new(color.green, 10), textcolor=color.white, size=size.tiny)
+    downCounter += 1
+else if lowerWick3
+    label.new(bar_index, low - offsetUnit * downCounter, "⬆️3連", style=label.style_label_up, color=color.new(color.green, 30), textcolor=color.white, size=size.tiny)
+    downCounter += 1
+if longerLowerWick and not spikeLow and not lowerWick3 and not lowerWick4
+    label.new(bar_index, low - offsetUnit * downCounter, "↑", style=label.style_label_up, color=color.new(color.green, 70), textcolor=color.green, size=size.tiny)
+    downCounter += 1
+if wickBelowMa5Rejected
+    label.new(bar_index, low - offsetUnit * downCounter, "✓下抜け否定", style=label.style_label_up, color=color.new(color.blue, 30), textcolor=color.white, size=size.tiny)
+    downCounter += 1
+
+marketDownCounter = downCounter
+if nk_downText != "" and f_shouldShowMarket("N")
+    label.new(bar_index, low - offsetUnit * marketDownCounter, nk_downText, style=label.style_label_up, color=color.new(color.gray, 50), textcolor=nk_downWick ? color.green : color.white, size=size.tiny)
+    marketDownCounter += 1
+if tp_downText != "" and f_shouldShowMarket("T")
+    label.new(bar_index, low - offsetUnit * marketDownCounter, tp_downText, style=label.style_label_up, color=color.new(color.gray, 50), textcolor=tp_downWick ? color.green : color.white, size=size.tiny)
+    marketDownCounter += 1
+if sp_downText != "" and f_shouldShowMarket("S")
+    label.new(bar_index, low - offsetUnit * marketDownCounter, sp_downText, style=label.style_label_up, color=color.new(color.gray, 50), textcolor=sp_downWick ? color.green : color.white, size=size.tiny)
+    marketDownCounter += 1
+if nq_downText != "" and f_shouldShowMarket("Q")
+    label.new(bar_index, low - offsetUnit * marketDownCounter, nq_downText, style=label.style_label_up, color=color.new(color.gray, 50), textcolor=nq_downWick ? color.green : color.white, size=size.tiny)
+    marketDownCounter += 1
+
+bgcolor(close > ma5 ? color.new(color.green, 95) : color.new(color.red, 95), title="5日線との位置")
+
+// パーセンタイル計算関数
+f_percentile(arr, p) =>
+    sorted = array.copy(arr)
+    array.sort(sorted)
+    size = array.size(sorted)
+    if size == 0
+        0.0
+    else
+        idx = math.floor(size * p / 100)
+        idx := math.min(idx, size - 1)
+        array.get(sorted, idx)
+
+// 統計テーブル表示 (V3.3_tables.pineから - 長さの関係で基本統計のみ)
+if showStats and barstate.islast
+    tablePos = statsPosition == "右上" ? position.top_right : statsPosition == "右下" ? position.bottom_right : statsPosition == "左上" ? position.top_left : position.bottom_left
+    
+    if statsMode == "基本統計詳細"
+        var table statsTable = table.new(tablePos, 7, math.min(maxResults + 1, 50), border_width=1, border_color=color.gray)
+        
+        table.cell(statsTable, 0, 0, "シグナル", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(statsTable, 1, 0, "出現", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(statsTable, 2, 0, "始→当高\n勝率/PF", bgcolor=color.new(color.green, 80), text_color=color.white, text_size=size.tiny)
+        table.cell(statsTable, 3, 0, "始→当安\n勝率/PF", bgcolor=color.new(color.red, 80), text_color=color.white, text_size=size.tiny)
+        table.cell(statsTable, 4, 0, "始→当終\n勝率/PF", bgcolor=color.new(color.blue, 80), text_color=color.white, text_size=size.tiny)
+        table.cell(statsTable, 5, 0, "始→1終\n勝率/PF", bgcolor=color.new(color.blue, 80), text_color=color.white, text_size=size.tiny)
+        table.cell(statsTable, 6, 0, "始→2終\n勝率/PF", bgcolor=color.new(color.blue, 80), text_color=color.white, text_size=size.tiny)
+        
+        allSigs = array.from("N■","N●","N◆","N▼","N↓","N□","N○","N◇","N▲","N↑","N◆◆","N◇◇","N●×","N○×","N↑3","N↑4","N↓3","N↓4",
+                             "T■","T●","T◆","T▼","T↓","T□","T○","T◇","T▲","T↑","T◆◆","T◇◇","T●×","T○×","T↑3","T↑4","T↓3","T↓4",
+                             "S■","S●","S◆","S▼","S↓","S□","S○","S◇","S▲","S↑","S◆◆","S◇◇","S●×","S○×","S↑3","S↑4","S↓3","S↓4",
+                             "Q■","Q●","Q◆","Q▼","Q↓","Q□","Q○","Q◇","Q▲","Q↑","Q◆◆","Q◇◇","Q●×","Q○×","Q↑3","Q↑4","Q↓3","Q↓4")
+        
+        row = 1
+        for i = 0 to array.size(allSigs) - 1
+            if row > maxResults
+                break
+            
+            sig = array.get(allSigs, i)
+            marketCode = str.substring(sig, 0, 1)
+            
+            if not f_shouldShowMarket(marketCode)
+                continue
+            
+            cnt = f_getInt(stat_count, sig)
+            
+            if cnt >= minOccurrence
+                cnt_o0h = f_getInt(stat_o0h_cnt, sig)
+                win_o0h = f_getInt(stat_o0h_win, sig)
+                profit_o0h = f_getFloat(stat_o0h_profit, sig)
+                loss_o0h = f_getFloat(stat_o0h_loss, sig)
+                wr_o0h = cnt_o0h > 0 ? win_o0h / cnt_o0h * 100 : 0
+                pf_o0h = loss_o0h > 0 ? profit_o0h / loss_o0h : (profit_o0h > 0 ? 99 : 0)
+                
+                cnt_o0l = f_getInt(stat_o0l_cnt, sig)
+                win_o0l = f_getInt(stat_o0l_win, sig)
+                profit_o0l = f_getFloat(stat_o0l_profit, sig)
+                loss_o0l = f_getFloat(stat_o0l_loss, sig)
+                wr_o0l = cnt_o0l > 0 ? win_o0l / cnt_o0l * 100 : 0
+                pf_o0l = loss_o0l > 0 ? profit_o0l / loss_o0l : (profit_o0l > 0 ? 99 : 0)
+                
+                cnt_o0c = f_getInt(stat_o0c_cnt, sig)
+                win_o0c = f_getInt(stat_o0c_win, sig)
+                profit_o0c = f_getFloat(stat_o0c_profit, sig)
+                loss_o0c = f_getFloat(stat_o0c_loss, sig)
+                wr_o0c = cnt_o0c > 0 ? win_o0c / cnt_o0c * 100 : 0
+                pf_o0c = loss_o0c > 0 ? profit_o0c / loss_o0c : (profit_o0c > 0 ? 99 : 0)
+                
+                cnt_o1c = f_getInt(stat_o1c_cnt, sig)
+                win_o1c = f_getInt(stat_o1c_win, sig)
+                profit_o1c = f_getFloat(stat_o1c_profit, sig)
+                loss_o1c = f_getFloat(stat_o1c_loss, sig)
+                wr_o1c = cnt_o1c > 0 ? win_o1c / cnt_o1c * 100 : 0
+                pf_o1c = loss_o1c > 0 ? profit_o1c / loss_o1c : (profit_o1c > 0 ? 99 : 0)
+                
+                cnt_o2c = f_getInt(stat_o2c_cnt, sig)
+                win_o2c = f_getInt(stat_o2c_win, sig)
+                profit_o2c = f_getFloat(stat_o2c_profit, sig)
+                loss_o2c = f_getFloat(stat_o2c_loss, sig)
+                wr_o2c = cnt_o2c > 0 ? win_o2c / cnt_o2c * 100 : 0
+                pf_o2c = loss_o2c > 0 ? profit_o2c / loss_o2c : (profit_o2c > 0 ? 99 : 0)
+                
+                anyPassFilter = (wr_o0h >= minWinRate and pf_o0h >= minPF) or 
+                                 (wr_o0l >= minWinRate and pf_o0l >= minPF) or
+                                 (wr_o0c >= minWinRate and pf_o0c >= minPF) or
+                                 (wr_o1c >= minWinRate and pf_o1c >= minPF) or
+                                 (wr_o2c >= minWinRate and pf_o2c >= minPF)
+                
+                if anyPassFilter
+                    table.cell(statsTable, 0, row, sig, text_color=color.white, text_size=size.tiny)
+                    table.cell(statsTable, 1, row, str.tostring(cnt), text_color=color.white, text_size=size.tiny)
+                    table.cell(statsTable, 2, row, str.tostring(wr_o0h, "#.#") + "%/" + str.tostring(pf_o0h, "#.#"), text_color=color.white, text_size=size.tiny)
+                    table.cell(statsTable, 3, row, str.tostring(wr_o0l, "#.#") + "%/" + str.tostring(pf_o0l, "#.#"), text_color=color.white, text_size=size.tiny)
+                    table.cell(statsTable, 4, row, str.tostring(wr_o0c, "#.#") + "%/" + str.tostring(pf_o0c, "#.#"), text_color=color.white, text_size=size.tiny)
+                    table.cell(statsTable, 5, row, str.tostring(wr_o1c, "#.#") + "%/" + str.tostring(pf_o1c, "#.#"), text_color=color.white, text_size=size.tiny)
+                    table.cell(statsTable, 6, row, str.tostring(wr_o2c, "#.#") + "%/" + str.tostring(pf_o2c, "#.#"), text_color=color.white, text_size=size.tiny)
+                    row += 1
+
+
+    else if statsMode == "エントリー最適化-全データ"
+        var table optTable = table.new(tablePos, 8, 22, border_width=1, border_color=color.gray)
+        
+        table.cell(optTable, 0, 0, "対象: " + optimizeSignal, bgcolor=color.new(color.purple, 70), text_color=color.white, text_size=size.small)
+        table.merge_cells(optTable, 0, 0, 7, 0)
+        
+        table.cell(optTable, 0, 1, "目標", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optTable, 1, 1, "出現", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optTable, 2, 1, "勝率", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optTable, 3, 1, "期待値", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optTable, 4, 1, "総利益", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optTable, 5, 1, "PF", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optTable, 6, 1, "25%tile", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optTable, 7, 1, "75%tile", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        
+        filteredChanges = array.new<float>()
+        filteredEntryOpen = array.new<float>()
+        filteredDay0High = array.new<float>()
+        filteredDay0Low = array.new<float>()
+        filteredDay0Close = array.new<float>()
+        filteredDay1Close = array.new<float>()
+        filteredIsBearish = array.new<bool>()
+        
+        for i = 0 to array.size(opt_signals) - 1
+            if array.get(opt_signals, i) == optimizeSignal
+                array.push(filteredChanges, array.get(opt_priceChanges, i))
+                array.push(filteredEntryOpen, array.get(opt_entryOpen, i))
+                array.push(filteredDay0High, array.get(opt_day0High, i))
+                array.push(filteredDay0Low, array.get(opt_day0Low, i))
+                array.push(filteredDay0Close, array.get(opt_day0Close, i))
+                array.push(filteredDay1Close, array.get(opt_day1Close, i))
+                array.push(filteredIsBearish, array.get(opt_isBearish, i))
+        
+        totalCount = array.size(filteredChanges)
+        
+        if totalCount > 0
+            p25 = f_percentile(filteredChanges, 25)
+            p75 = f_percentile(filteredChanges, 75)
+            
+            targets = array.from("当日高値", "当日安値", "当日終値", "翌日終値")
+            row = 2
+            
+            for j = 0 to array.size(targets) - 1
+                target = array.get(targets, j)
+                
+                winCount = 0
+                totalProfit = 0.0
+                totalLoss = 0.0
+                returnArray = array.new<float>()
+                
+                for i = 0 to totalCount - 1
+                    entryOpen = array.get(filteredEntryOpen, i)
+                    isBearish = array.get(filteredIsBearish, i)
+                    
+                    exitPrice = 0.0
+                    if target == "当日高値"
+                        exitPrice := array.get(filteredDay0High, i)
+                    else if target == "当日安値"
+                        exitPrice := array.get(filteredDay0Low, i)
+                    else if target == "当日終値"
+                        exitPrice := array.get(filteredDay0Close, i)
+                    else
+                        exitPrice := array.get(filteredDay1Close, i)
+                    
+                    ret = (exitPrice - entryOpen) / entryOpen
+                    array.push(returnArray, ret)
+                    
+                    isWin = (isBearish and ret < 0) or (not isBearish and ret > 0)
+                    if isWin
+                        winCount += 1
+                        totalProfit += math.abs(ret)
+                    else
+                        totalLoss += math.abs(ret)
+                
+                winRate = totalCount > 0 ? winCount / totalCount * 100 : 0
+                avgReturn = totalCount > 0 ? array.avg(returnArray) : 0
+                netProfit = totalProfit - totalLoss
+                pf = totalLoss > 0 ? totalProfit / totalLoss : (totalProfit > 0 ? 99 : 0)
+                p25_ret = f_percentile(returnArray, 25)
+                p75_ret = f_percentile(returnArray, 75)
+                
+                table.cell(optTable, 0, row, target, text_color=color.white, text_size=size.tiny)
+                table.cell(optTable, 1, row, str.tostring(totalCount), text_color=color.white, text_size=size.tiny)
+                table.cell(optTable, 2, row, str.tostring(winRate, "#.#") + "%", text_color=color.white, text_size=size.tiny)
+                table.cell(optTable, 3, row, str.tostring(avgReturn * 100, "#.##") + "%", text_color=avgReturn > 0 ? color.lime : color.red, text_size=size.tiny)
+                table.cell(optTable, 4, row, str.tostring(netProfit * 100, "#.##") + "%", text_color=netProfit > 0 ? color.lime : color.red, text_size=size.tiny)
+                table.cell(optTable, 5, row, str.tostring(pf, "#.##"), text_color=color.white, text_size=size.tiny)
+                table.cell(optTable, 6, row, str.tostring(p25_ret * 100, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+                table.cell(optTable, 7, row, str.tostring(p75_ret * 100, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+                
+                row += 1
+            
+            table.cell(optTable, 0, row, "価格変動分布", bgcolor=color.new(color.blue, 70), text_color=color.white, text_size=size.tiny)
+            table.merge_cells(optTable, 0, row, 7, row)
+            row += 1
+            
+            table.cell(optTable, 0, row, "25%tile", text_color=color.white, text_size=size.tiny)
+            table.cell(optTable, 1, row, str.tostring(p25 * 100, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+            table.merge_cells(optTable, 1, row, 3, row)
+            table.cell(optTable, 4, row, "75%tile", text_color=color.white, text_size=size.tiny)
+            table.cell(optTable, 5, row, str.tostring(p75 * 100, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+            table.merge_cells(optTable, 5, row, 7, row)
+        else
+            table.cell(optTable, 0, 2, "データなし", text_color=color.white, text_size=size.normal)
+            table.merge_cells(optTable, 0, 2, 7, 2)
+    
+    else if statsMode == "MA関係別統計"
+        var table maStatsTable = table.new(tablePos, 8, math.min(maxResults + 1, 50), border_width=1, border_color=color.gray)
+        
+        table.cell(maStatsTable, 0, 0, "シグナル", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(maStatsTable, 1, 0, "MA関係", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(maStatsTable, 2, 0, "出現", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(maStatsTable, 3, 0, "始→当終\n勝率", bgcolor=color.new(color.blue, 80), text_color=color.white, text_size=size.tiny)
+        table.cell(maStatsTable, 4, 0, "始→当終\nPF", bgcolor=color.new(color.blue, 80), text_color=color.white, text_size=size.tiny)
+        table.cell(maStatsTable, 5, 0, "始→翌終\n勝率", bgcolor=color.new(color.purple, 80), text_color=color.white, text_size=size.tiny)
+        table.cell(maStatsTable, 6, 0, "始→翌終\nPF", bgcolor=color.new(color.purple, 80), text_color=color.white, text_size=size.tiny)
+        table.cell(maStatsTable, 7, 0, "総利益", bgcolor=color.new(color.green, 80), text_color=color.white, text_size=size.tiny)
+        
+        allSigs = array.from("N■","N●","N◆","N▼","N↓","N□","N○","N◇","N▲","N↑","N◆◆","N◇◇","N●×","N○×","N↑3","N↑4","N↓3","N↓4",
+                             "T■","T●","T◆","T▼","T↓","T□","T○","T◇","T▲","T↑","T◆◆","T◇◇","T●×","T○×","T↑3","T↑4","T↓3","T↓4",
+                             "S■","S●","S◆","S▼","S↓","S□","S○","S◇","S▲","S↑","S◆◆","S◇◇","S●×","S○×","S↑3","S↑4","S↓3","S↓4",
+                             "Q■","Q●","Q◆","Q▼","Q↓","Q□","Q○","Q◇","Q▲","Q↑","Q◆◆","Q◇◇","Q●×","Q○×","Q↑3","Q↑4","Q↓3","Q↓4")
+        maPatterns = array.from("①始>5>25", "②始>25>5", "③5>始>25", "④5>25>始", "⑤25>始>5", "⑥25>5>始")
+        
+        row = 1
+        for i = 0 to array.size(allSigs) - 1
+            if row > maxResults
+                break
+            
+            sig = array.get(allSigs, i)
+            marketCode = str.substring(sig, 0, 1)
+            
+            if not f_shouldShowMarket(marketCode)
+                continue
+            
+            for p = 0 to array.size(maPatterns) - 1
+                if row > maxResults
+                    break
+                
+                pattern = array.get(maPatterns, p)
+                key = sig + "_" + pattern
+                
+                cnt = f_getInt(stat_ma_count, key)
+                
+                if cnt >= minOccurrence
+                    cnt_o0c = f_getInt(stat_ma_o0c_cnt, key)
+                    win_o0c = f_getInt(stat_ma_o0c_win, key)
+                    profit_o0c = f_getFloat(stat_ma_o0c_profit, key)
+                    loss_o0c = f_getFloat(stat_ma_o0c_loss, key)
+                    wr_o0c = cnt_o0c > 0 ? win_o0c / cnt_o0c * 100 : 0
+                    pf_o0c = loss_o0c > 0 ? profit_o0c / loss_o0c : (profit_o0c > 0 ? 99 : 0)
+                    
+                    cnt_o1c = f_getInt(stat_ma_o1c_cnt, key)
+                    win_o1c = f_getInt(stat_ma_o1c_win, key)
+                    profit_o1c = f_getFloat(stat_ma_o1c_profit, key)
+                    loss_o1c = f_getFloat(stat_ma_o1c_loss, key)
+                    wr_o1c = cnt_o1c > 0 ? win_o1c / cnt_o1c * 100 : 0
+                    pf_o1c = loss_o1c > 0 ? profit_o1c / loss_o1c : (profit_o1c > 0 ? 99 : 0)
+                    
+                    netProfit_o0c = profit_o0c - loss_o0c
+                    
+                    if (wr_o0c >= minWinRate and pf_o0c >= minPF) or (wr_o1c >= minWinRate and pf_o1c >= minPF)
+                        table.cell(maStatsTable, 0, row, sig, text_color=color.white, text_size=size.tiny)
+                        table.cell(maStatsTable, 1, row, pattern, text_color=color.yellow, text_size=size.tiny)
+                        table.cell(maStatsTable, 2, row, str.tostring(cnt), text_color=color.white, text_size=size.tiny)
+                        table.cell(maStatsTable, 3, row, str.tostring(wr_o0c, "#.#") + "%", text_color=color.white, text_size=size.tiny)
+                        table.cell(maStatsTable, 4, row, str.tostring(pf_o0c, "#.#"), text_color=color.white, text_size=size.tiny)
+                        table.cell(maStatsTable, 5, row, str.tostring(wr_o1c, "#.#") + "%", text_color=color.white, text_size=size.tiny)
+                        table.cell(maStatsTable, 6, row, str.tostring(pf_o1c, "#.#"), text_color=color.white, text_size=size.tiny)
+                        table.cell(maStatsTable, 7, row, str.tostring(netProfit_o0c, "#.##") + "%", 
+                                   text_color=netProfit_o0c > 0 ? color.lime : color.red, text_size=size.tiny)
+                        row += 1
+    
+    else if statsMode == "エントリー最適化-MA関係別"
+        var table optMaTable = table.new(tablePos, 8, 22, border_width=1, border_color=color.gray)
+        
+        table.cell(optMaTable, 0, 0, "対象: " + optimizeSignal + " / MA: " + optimizeMaPattern, 
+                   bgcolor=color.new(color.purple, 70), text_color=color.white, text_size=size.small)
+        table.merge_cells(optMaTable, 0, 0, 7, 0)
+        
+        table.cell(optMaTable, 0, 1, "目標", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optMaTable, 1, 1, "出現", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optMaTable, 2, 1, "勝率", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optMaTable, 3, 1, "期待値", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optMaTable, 4, 1, "総利益", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optMaTable, 5, 1, "PF", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optMaTable, 6, 1, "25%tile", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        table.cell(optMaTable, 7, 1, "75%tile", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+        
+        filteredChanges = array.new<float>()
+        filteredEntryOpen = array.new<float>()
+        filteredDay0High = array.new<float>()
+        filteredDay0Low = array.new<float>()
+        filteredDay0Close = array.new<float>()
+        filteredDay1Close = array.new<float>()
+        filteredIsBearish = array.new<bool>()
+        
+        for i = 0 to array.size(opt_signals) - 1
+            if array.get(opt_signals, i) == optimizeSignal and array.get(opt_maPatterns, i) == optimizeMaPattern
+                array.push(filteredChanges, array.get(opt_priceChanges, i))
+                array.push(filteredEntryOpen, array.get(opt_entryOpen, i))
+                array.push(filteredDay0High, array.get(opt_day0High, i))
+                array.push(filteredDay0Low, array.get(opt_day0Low, i))
+                array.push(filteredDay0Close, array.get(opt_day0Close, i))
+                array.push(filteredDay1Close, array.get(opt_day1Close, i))
+                array.push(filteredIsBearish, array.get(opt_isBearish, i))
+        
+        totalCount = array.size(filteredChanges)
+        
+        if totalCount > 0
+            p25 = f_percentile(filteredChanges, 25)
+            p75 = f_percentile(filteredChanges, 75)
+            
+            targets = array.from("当日高値", "当日安値", "当日終値", "翌日終値")
+            row = 2
+            
+            for j = 0 to array.size(targets) - 1
+                target = array.get(targets, j)
+                
+                winCount = 0
+                totalProfit = 0.0
+                totalLoss = 0.0
+                returnArray = array.new<float>()
+                
+                for i = 0 to totalCount - 1
+                    entryOpen = array.get(filteredEntryOpen, i)
+                    isBearish = array.get(filteredIsBearish, i)
+                    
+                    exitPrice = 0.0
+                    if target == "当日高値"
+                        exitPrice := array.get(filteredDay0High, i)
+                    else if target == "当日安値"
+                        exitPrice := array.get(filteredDay0Low, i)
+                    else if target == "当日終値"
+                        exitPrice := array.get(filteredDay0Close, i)
+                    else
+                        exitPrice := array.get(filteredDay1Close, i)
+                    
+                    ret = (exitPrice - entryOpen) / entryOpen
+                    array.push(returnArray, ret)
+                    
+                    isWin = (isBearish and ret < 0) or (not isBearish and ret > 0)
+                    if isWin
+                        winCount += 1
+                        totalProfit += math.abs(ret)
+                    else
+                        totalLoss += math.abs(ret)
+                
+                winRate = totalCount > 0 ? winCount / totalCount * 100 : 0
+                avgReturn = totalCount > 0 ? array.avg(returnArray) : 0
+                netProfit = totalProfit - totalLoss
+                pf = totalLoss > 0 ? totalProfit / totalLoss : (totalProfit > 0 ? 99 : 0)
+                p25_ret = f_percentile(returnArray, 25)
+                p75_ret = f_percentile(returnArray, 75)
+                
+                table.cell(optMaTable, 0, row, target, text_color=color.white, text_size=size.tiny)
+                table.cell(optMaTable, 1, row, str.tostring(totalCount), text_color=color.white, text_size=size.tiny)
+                table.cell(optMaTable, 2, row, str.tostring(winRate, "#.#") + "%", text_color=color.white, text_size=size.tiny)
+                table.cell(optMaTable, 3, row, str.tostring(avgReturn * 100, "#.##") + "%", text_color=avgReturn > 0 ? color.lime : color.red, text_size=size.tiny)
+                table.cell(optMaTable, 4, row, str.tostring(netProfit * 100, "#.##") + "%", text_color=netProfit > 0 ? color.lime : color.red, text_size=size.tiny)
+                table.cell(optMaTable, 5, row, str.tostring(pf, "#.##"), text_color=color.white, text_size=size.tiny)
+                table.cell(optMaTable, 6, row, str.tostring(p25_ret * 100, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+                table.cell(optMaTable, 7, row, str.tostring(p75_ret * 100, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+                
+                row += 1
+            
+            table.cell(optMaTable, 0, row, "価格変動分布", bgcolor=color.new(color.blue, 70), text_color=color.white, text_size=size.tiny)
+            table.merge_cells(optMaTable, 0, row, 7, row)
+            row += 1
+            
+            table.cell(optMaTable, 0, row, "25%tile", text_color=color.white, text_size=size.tiny)
+            table.cell(optMaTable, 1, row, str.tostring(p25 * 100, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+            table.merge_cells(optMaTable, 1, row, 3, row)
+            table.cell(optMaTable, 4, row, "75%tile", text_color=color.white, text_size=size.tiny)
+            table.cell(optMaTable, 5, row, str.tostring(p75 * 100, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+            table.merge_cells(optMaTable, 5, row, 7, row)
+        else
+            table.cell(optMaTable, 0, 2, "データなし", text_color=color.white, text_size=size.normal)
+            table.merge_cells(optMaTable, 0, 2, 7, 2)
+
+
+// レジェンド
+var table legendTable = table.new(position.top_left, 2, 12, border_width=1, border_color=color.gray)
+
+if barstate.islast
+    table.cell(legendTable, 0, 0, "記号", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 0, "意味", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 1, "■/□", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 1, "スパイクハイ/ロー", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 2, "●/○", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 2, "包み線", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 3, "◆/◇", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 3, "はらみ線", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 4, "◆◆/◇◇", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 4, "陰の陰/陽の陽はらみ", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 5, "●×/○×", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 5, "包み足の否定", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 6, "▼/▲", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 6, "ブレイク否定", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 7, "↑3/↓3", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 7, "髭3連続", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 8, "↑4/↓4", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 8, "髭4連続", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 9, "赤文字/緑文字", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 9, "髭長い", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 10, "N/T/S/Q", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 10, "日経/TOPIX/SP500/NASDAQ", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 0, 11, "売/買", text_color=color.white, text_size=size.tiny)
+    table.cell(legendTable, 1, 11, "売りシグナル/買いシグナル", text_color=color.white, text_size=size.tiny)
