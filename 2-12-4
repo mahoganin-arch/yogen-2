@@ -1,0 +1,675 @@
+//@version=6
+strategy("日経225先物 - シグナルベースストラテジー V2.0", overlay=true, 
+         initial_capital=5000000, default_qty_value=1, default_qty_type=strategy.fixed,
+         pyramiding=1, commission_type=strategy.commission.percent, 
+         commission_value=0, slippage=0)
+
+// ═══════════════════════════════════════════════════════════
+// ストラテジー設定
+// ═══════════════════════════════════════════════════════════
+
+// シグナル選択
+entrySignalType = input.string("N下陽", "エントリーシグナル", 
+  options=["N上陽","N上陰","N下陽","N下陰","N●","N◆","N▼","N↓","N○","N◇","N▲","N↑","N◆◆","N◇◇","N●×","N○×","N↑3","N↑4","N↓3","N↓4",
+           "T上陽","T上陰","T下陽","T下陰","T●","T◆","T▼","T↓","T○","T◇","T▲","T↑","T◆◆","T◇◇","T●×","T○×","T↑3","T↑4","T↓3","T↓4",
+           "S上陽","S上陰","S下陽","S下陰","S●","S◆","S▼","S↓","S○","S◇","S▲","S↑","S◆◆","S◇◇","S●×","S○×","S↑3","S↑4","S↓3","S↓4",
+           "Q上陽","Q上陰","Q下陽","Q下陰","Q●","Q◆","Q▼","Q↓","Q○","Q◇","Q▲","Q↑","Q◆◆","Q◇◇","Q●×","Q○×","Q↑3","Q↑4","Q↓3","Q↓4"],
+  group="シグナル設定")
+
+// MA関係フィルター
+useMaFilter = input.bool(false, "MA関係フィルターを使用", group="シグナル設定")
+maFilterPattern = input.string("①始>5>25", "MA関係", 
+  options=["①始>5>25", "②始>25>5", "③5>始>25", "④5>25>始", "⑤25>始>5", "⑥25>5>始"],
+  group="シグナル設定")
+maFilterTiming = input.string("シグナルバー", "MA関係の判定タイミング",
+  options=["シグナルバー", "エントリーバー"], 
+  group="シグナル設定")
+
+// エントリー方法
+entryMethod = input.string("次バー始値", "エントリー方法",
+  options=["次バー始値", "指値A", "指値C", "指値E", "フィボナッチ", "MA1H", "MAD"],
+  group="エントリー設定")
+
+// 指値C用パラメータ
+rangePercent = input.float(0.3, "レンジ比率", minval=0.1, maxval=0.9, step=0.1, group="エントリー設定")
+
+// 指値E用パラメータ
+atrMultiplier = input.float(0.5, "ATR倍率", minval=0.1, maxval=2.0, step=0.1, group="エントリー設定")
+
+// フィボナッチ用パラメータ
+fiboLevel = input.string("50%", "フィボナッチレベル", 
+  options=["38.2%", "50%", "61.8%"], group="エントリー設定")
+
+// MAタッチ用パラメータ
+maTypeForEntry = input.string("5MA", "MAタッチ - MA種類", 
+  options=["5MA", "25MA"], group="エントリー設定")
+
+// イグジット設定
+exitType = input.string("翌日終値", "イグジットタイミング", 
+  options=["当日終値", "翌日終値", "翌々日終値"],
+  group="イグジット設定")
+
+// 表示設定
+showSignals = input.bool(true, "シグナルを表示", group="表示設定")
+showEntryExit = input.bool(true, "エントリー/イグジットを表示", group="表示設定")
+showDailyMA = input.bool(true, "日足MAを表示", group="表示設定")
+
+// ═══════════════════════════════════════════════════════════
+// 1時間足の移動平均線
+// ═══════════════════════════════════════════════════════════
+ma5_1h = ta.sma(close, 5)
+ma25_1h = ta.sma(close, 25)
+
+plot(ma5_1h, "5MA(1H)", color=color.new(color.blue, 0), linewidth=1)
+plot(ma25_1h, "25MA(1H)", color=color.new(color.red, 0), linewidth=1)
+
+// ═══════════════════════════════════════════════════════════
+// 日足データの取得
+// ═══════════════════════════════════════════════════════════
+
+// 日足の移動平均線（表示用）
+ma5_daily = request.security(syminfo.tickerid, "D", ta.sma(close, 5), lookahead=barmerge.lookahead_off)
+ma25_daily = request.security(syminfo.tickerid, "D", ta.sma(close, 25), lookahead=barmerge.lookahead_off)
+
+plot(showDailyMA ? ma5_daily : na, "5MA(日足)", color=color.new(color.aqua, 0), linewidth=2, style=plot.style_line)
+plot(showDailyMA ? ma25_daily : na, "25MA(日足)", color=color.new(color.orange, 0), linewidth=2, style=plot.style_line)
+
+// 日足の各市場データ（シグナル検出用）
+// 日本市場: lookahead_off
+// 米国市場: lookahead_on (時差補正のため)
+[nk_open, nk_high, nk_low, nk_close] = request.security("TVC:NI225", "D", [open, high, low, close], lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+[tp_open, tp_high, tp_low, tp_close] = request.security("TSE:TOPIX", "D", [open, high, low, close], lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+[sp_open, sp_high, sp_low, sp_close] = request.security("SP:SPX", "D", [open, high, low, close], lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+[nq_open, nq_high, nq_low, nq_close] = request.security("NASDAQ:NDX", "D", [open, high, low, close], lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+
+// ═══════════════════════════════════════════════════════════
+// シグナル検出関数
+// ═══════════════════════════════════════════════════════════
+f_detectSignals(o, h, l, c, o1, h1, l1, c1, ma5_val) =>
+    body = math.abs(c - o)
+    upperWick = h - math.max(c, o)
+    lowerWick = math.min(c, o) - l
+    
+    isBullish = c > o
+    isBearish = c < o
+    prevBullish = c1 > o1
+    prevBearish = c1 < o1
+    
+    bodyTop = isBullish ? c : o
+    bodyBottom = isBullish ? o : c
+    prevBodyTop = prevBullish ? c1 : o1
+    prevBodyBottom = prevBullish ? o1 : c1
+    
+    // スパイク条件（髭 >= 実体 × 3）
+    spikeHighRaw = upperWick >= body * 3 and body > 0
+    spikeLowRaw = lowerWick >= body * 3 and body > 0
+    
+    // 両方成立する場合は除外
+    bothSpikes = spikeHighRaw and spikeLowRaw
+    
+    // 新しい4パターンのスパイクシグナル（両方成立時は除外）
+    spikeHighBullish = spikeHighRaw and not bothSpikes and isBullish  // 上髭スパイク + 陽線 → 買い
+    spikeHighBearish = spikeHighRaw and not bothSpikes and isBearish  // 上髭スパイク + 陰線 → 売り
+    spikeLowBullish = spikeLowRaw and not bothSpikes and isBullish    // 下髭スパイク + 陽線 → 買い
+    spikeLowBearish = spikeLowRaw and not bothSpikes and isBearish    // 下髭スパイク + 陰線 → 売り
+    
+    bearishHarami = prevBullish and isBearish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+    bearishEngulfing = prevBullish and isBearish and bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom
+    bullishHarami = prevBearish and isBullish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+    bullishEngulfing = prevBearish and isBullish and bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom
+    
+    bearishBearishHarami = prevBearish and isBearish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+    bullishBullishHarami = prevBullish and isBullish and bodyTop <= prevBodyTop and bodyBottom >= prevBodyBottom
+    
+    bearishEngulfingRejected = prevBullish and isBearish and o > c1 and h >= h1 and l <= l1 and not (bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom)
+    bullishEngulfingRejected = prevBearish and isBullish and o < c1 and h >= h1 and l <= l1 and not (bodyTop >= prevBodyTop and bodyBottom <= prevBodyBottom)
+    
+    longerUpperWick = upperWick > lowerWick
+    longerLowerWick = lowerWick > upperWick
+    
+    wickBelowMa5Rejected = l < ma5_val and c > ma5_val and o > ma5_val
+    wickAboveMa5Rejected = h > ma5_val and c < ma5_val and o < ma5_val
+    
+    [spikeHighBullish, spikeHighBearish, spikeLowBullish, spikeLowBearish,
+     bearishEngulfing, bullishEngulfing, bearishHarami, bullishHarami, 
+     longerUpperWick, longerLowerWick, wickAboveMa5Rejected, wickBelowMa5Rejected,
+     bearishBearishHarami, bullishBullishHarami, bearishEngulfingRejected, bullishEngulfingRejected]
+
+// ═══════════════════════════════════════════════════════════
+// MA関係判定関数
+// ═══════════════════════════════════════════════════════════
+f_getMaPattern(entryOpen, ma5Val, ma25Val) =>
+    pattern = ""
+    if entryOpen > ma5Val and ma5Val > ma25Val
+        pattern := "①始>5>25"
+    else if entryOpen > ma25Val and ma25Val > ma5Val
+        pattern := "②始>25>5"
+    else if ma5Val > entryOpen and entryOpen > ma25Val
+        pattern := "③5>始>25"
+    else if ma5Val > ma25Val and ma25Val > entryOpen
+        pattern := "④5>25>始"
+    else if ma25Val > entryOpen and entryOpen > ma5Val
+        pattern := "⑤25>始>5"
+    else if ma25Val > ma5Val and ma5Val > entryOpen
+        pattern := "⑥25>5>始"
+    pattern
+
+// ═══════════════════════════════════════════════════════════
+// 日足の各市場シグナル検出
+// ═══════════════════════════════════════════════════════════
+[nk_spikeHighBull, nk_spikeHighBear, nk_spikeLowBull, nk_spikeLowBear, nk_bearishEng, nk_bullishEng, nk_bearishHar, nk_bullishHar, nk_upperWick, nk_lowerWick, nk_wickAbove, nk_wickBelow, nk_bbHar, nk_bbullHar, nk_bearEngRej, nk_bullEngRej] = f_detectSignals(nk_open, nk_high, nk_low, nk_close, nk_open[1], nk_high[1], nk_low[1], nk_close[1], ta.sma(nk_close, 5))
+[tp_spikeHighBull, tp_spikeHighBear, tp_spikeLowBull, tp_spikeLowBear, tp_bearishEng, tp_bullishEng, tp_bearishHar, tp_bullishHar, tp_upperWick, tp_lowerWick, tp_wickAbove, tp_wickBelow, tp_bbHar, tp_bbullHar, tp_bearEngRej, tp_bullEngRej] = f_detectSignals(tp_open, tp_high, tp_low, tp_close, tp_open[1], tp_high[1], tp_low[1], tp_close[1], ta.sma(tp_close, 5))
+[sp_spikeHighBull, sp_spikeHighBear, sp_spikeLowBull, sp_spikeLowBear, sp_bearishEng, sp_bullishEng, sp_bearishHar, sp_bullishHar, sp_upperWick, sp_lowerWick, sp_wickAbove, sp_wickBelow, sp_bbHar, sp_bbullHar, sp_bearEngRej, sp_bullEngRej] = f_detectSignals(sp_open, sp_high, sp_low, sp_close, sp_open[1], sp_high[1], sp_low[1], sp_close[1], ta.sma(sp_close, 5))
+[nq_spikeHighBull, nq_spikeHighBear, nq_spikeLowBull, nq_spikeLowBear, nq_bearishEng, nq_bullishEng, nq_bearishHar, nq_bullishHar, nq_upperWick, nq_lowerWick, nq_wickAbove, nq_wickBelow, nq_bbHar, nq_bbullHar, nq_bearEngRej, nq_bullEngRej] = f_detectSignals(nq_open, nq_high, nq_low, nq_close, nq_open[1], nq_high[1], nq_low[1], nq_close[1], ta.sma(nq_close, 5))
+
+// 連続ウィックパターン
+nk_lowerWick4 = nk_lowerWick and nk_lowerWick[1] and nk_lowerWick[2] and nk_lowerWick[3]
+nk_lowerWick3 = nk_lowerWick and nk_lowerWick[1] and nk_lowerWick[2] and not nk_lowerWick4
+nk_upperWick4 = nk_upperWick and nk_upperWick[1] and nk_upperWick[2] and nk_upperWick[3]
+nk_upperWick3 = nk_upperWick and nk_upperWick[1] and nk_upperWick[2] and not nk_upperWick4
+
+tp_lowerWick4 = tp_lowerWick and tp_lowerWick[1] and tp_lowerWick[2] and tp_lowerWick[3]
+tp_lowerWick3 = tp_lowerWick and tp_lowerWick[1] and tp_lowerWick[2] and not tp_lowerWick4
+tp_upperWick4 = tp_upperWick and tp_upperWick[1] and tp_upperWick[2] and tp_upperWick[3]
+tp_upperWick3 = tp_upperWick and tp_upperWick[1] and tp_upperWick[2] and not tp_upperWick4
+
+sp_lowerWick4 = sp_lowerWick and sp_lowerWick[1] and sp_lowerWick[2] and sp_lowerWick[3]
+sp_lowerWick3 = sp_lowerWick and sp_lowerWick[1] and sp_lowerWick[2] and not sp_lowerWick4
+sp_upperWick4 = sp_upperWick and sp_upperWick[1] and sp_upperWick[2] and sp_upperWick[3]
+sp_upperWick3 = sp_upperWick and sp_upperWick[1] and sp_upperWick[2] and not sp_upperWick4
+
+nq_lowerWick4 = nq_lowerWick and nq_lowerWick[1] and nq_lowerWick[2] and nq_lowerWick[3]
+nq_lowerWick3 = nq_lowerWick and nq_lowerWick[1] and nq_lowerWick[2] and not nq_lowerWick4
+nq_upperWick4 = nq_upperWick and nq_upperWick[1] and nq_upperWick[2] and nq_upperWick[3]
+nq_upperWick3 = nq_upperWick and nq_upperWick[1] and nq_upperWick[2] and not nq_upperWick4
+
+// ═══════════════════════════════════════════════════════════
+// シグナルマッピング関数
+// ═══════════════════════════════════════════════════════════
+f_checkSignal(signalName) =>
+    isSignal = false
+    isBearishSignal = false
+    
+    // 日経現物 (N)
+    if signalName == "N上陽"
+        isSignal := nk_spikeHighBull
+        isBearishSignal := false
+    else if signalName == "N上陰"
+        isSignal := nk_spikeHighBear
+        isBearishSignal := true
+    else if signalName == "N下陽"
+        isSignal := nk_spikeLowBull
+        isBearishSignal := false
+    else if signalName == "N下陰"
+        isSignal := nk_spikeLowBear
+        isBearishSignal := true
+    else if signalName == "N●"
+        isSignal := nk_bearishEng
+        isBearishSignal := true
+    else if signalName == "N◆"
+        isSignal := nk_bearishHar
+        isBearishSignal := true
+    else if signalName == "N▼"
+        isSignal := nk_wickAbove
+        isBearishSignal := true
+    else if signalName == "N↓"
+        isSignal := nk_upperWick
+        isBearishSignal := true
+    else if signalName == "N○"
+        isSignal := nk_bullishEng
+        isBearishSignal := false
+    else if signalName == "N◇"
+        isSignal := nk_bullishHar
+        isBearishSignal := false
+    else if signalName == "N▲"
+        isSignal := nk_wickBelow
+        isBearishSignal := false
+    else if signalName == "N↑"
+        isSignal := nk_lowerWick
+        isBearishSignal := false
+    else if signalName == "N◆◆"
+        isSignal := nk_bbHar
+        isBearishSignal := false
+    else if signalName == "N◇◇"
+        isSignal := nk_bbullHar
+        isBearishSignal := true
+    else if signalName == "N●×"
+        isSignal := nk_bearEngRej
+        isBearishSignal := false
+    else if signalName == "N○×"
+        isSignal := nk_bullEngRej
+        isBearishSignal := true
+    else if signalName == "N↑3"
+        isSignal := nk_lowerWick3
+        isBearishSignal := false
+    else if signalName == "N↑4"
+        isSignal := nk_lowerWick4
+        isBearishSignal := false
+    else if signalName == "N↓3"
+        isSignal := nk_upperWick3
+        isBearishSignal := true
+    else if signalName == "N↓4"
+        isSignal := nk_upperWick4
+        isBearishSignal := true
+    
+    // TOPIX (T)
+    else if signalName == "T上陽"
+        isSignal := tp_spikeHighBull
+        isBearishSignal := false
+    else if signalName == "T上陰"
+        isSignal := tp_spikeHighBear
+        isBearishSignal := true
+    else if signalName == "T下陽"
+        isSignal := tp_spikeLowBull
+        isBearishSignal := false
+    else if signalName == "T下陰"
+        isSignal := tp_spikeLowBear
+        isBearishSignal := true
+    else if signalName == "T●"
+        isSignal := tp_bearishEng
+        isBearishSignal := true
+    else if signalName == "T◆"
+        isSignal := tp_bearishHar
+        isBearishSignal := true
+    else if signalName == "T▼"
+        isSignal := tp_wickAbove
+        isBearishSignal := true
+    else if signalName == "T↓"
+        isSignal := tp_upperWick
+        isBearishSignal := true
+    else if signalName == "T○"
+        isSignal := tp_bullishEng
+        isBearishSignal := false
+    else if signalName == "T◇"
+        isSignal := tp_bullishHar
+        isBearishSignal := false
+    else if signalName == "T▲"
+        isSignal := tp_wickBelow
+        isBearishSignal := false
+    else if signalName == "T↑"
+        isSignal := tp_lowerWick
+        isBearishSignal := false
+    else if signalName == "T◆◆"
+        isSignal := tp_bbHar
+        isBearishSignal := false
+    else if signalName == "T◇◇"
+        isSignal := tp_bbullHar
+        isBearishSignal := true
+    else if signalName == "T●×"
+        isSignal := tp_bearEngRej
+        isBearishSignal := false
+    else if signalName == "T○×"
+        isSignal := tp_bullEngRej
+        isBearishSignal := true
+    else if signalName == "T↑3"
+        isSignal := tp_lowerWick3
+        isBearishSignal := false
+    else if signalName == "T↑4"
+        isSignal := tp_lowerWick4
+        isBearishSignal := false
+    else if signalName == "T↓3"
+        isSignal := tp_upperWick3
+        isBearishSignal := true
+    else if signalName == "T↓4"
+        isSignal := tp_upperWick4
+        isBearishSignal := true
+    
+    // S&P500 (S)
+    else if signalName == "S上陽"
+        isSignal := sp_spikeHighBull
+        isBearishSignal := false
+    else if signalName == "S上陰"
+        isSignal := sp_spikeHighBear
+        isBearishSignal := true
+    else if signalName == "S下陽"
+        isSignal := sp_spikeLowBull
+        isBearishSignal := false
+    else if signalName == "S下陰"
+        isSignal := sp_spikeLowBear
+        isBearishSignal := true
+    else if signalName == "S●"
+        isSignal := sp_bearishEng
+        isBearishSignal := true
+    else if signalName == "S◆"
+        isSignal := sp_bearishHar
+        isBearishSignal := true
+    else if signalName == "S▼"
+        isSignal := sp_wickAbove
+        isBearishSignal := true
+    else if signalName == "S↓"
+        isSignal := sp_upperWick
+        isBearishSignal := true
+    else if signalName == "S○"
+        isSignal := sp_bullishEng
+        isBearishSignal := false
+    else if signalName == "S◇"
+        isSignal := sp_bullishHar
+        isBearishSignal := false
+    else if signalName == "S▲"
+        isSignal := sp_wickBelow
+        isBearishSignal := false
+    else if signalName == "S↑"
+        isSignal := sp_lowerWick
+        isBearishSignal := false
+    else if signalName == "S◆◆"
+        isSignal := sp_bbHar
+        isBearishSignal := false
+    else if signalName == "S◇◇"
+        isSignal := sp_bbullHar
+        isBearishSignal := true
+    else if signalName == "S●×"
+        isSignal := sp_bearEngRej
+        isBearishSignal := false
+    else if signalName == "S○×"
+        isSignal := sp_bullEngRej
+        isBearishSignal := true
+    else if signalName == "S↑3"
+        isSignal := sp_lowerWick3
+        isBearishSignal := false
+    else if signalName == "S↑4"
+        isSignal := sp_lowerWick4
+        isBearishSignal := false
+    else if signalName == "S↓3"
+        isSignal := sp_upperWick3
+        isBearishSignal := true
+    else if signalName == "S↓4"
+        isSignal := sp_upperWick4
+        isBearishSignal := true
+    
+    // NASDAQ (Q)
+    else if signalName == "Q上陽"
+        isSignal := nq_spikeHighBull
+        isBearishSignal := false
+    else if signalName == "Q上陰"
+        isSignal := nq_spikeHighBear
+        isBearishSignal := true
+    else if signalName == "Q下陽"
+        isSignal := nq_spikeLowBull
+        isBearishSignal := false
+    else if signalName == "Q下陰"
+        isSignal := nq_spikeLowBear
+        isBearishSignal := true
+    else if signalName == "Q●"
+        isSignal := nq_bearishEng
+        isBearishSignal := true
+    else if signalName == "Q◆"
+        isSignal := nq_bearishHar
+        isBearishSignal := true
+    else if signalName == "Q▼"
+        isSignal := nq_wickAbove
+        isBearishSignal := true
+    else if signalName == "Q↓"
+        isSignal := nq_upperWick
+        isBearishSignal := true
+    else if signalName == "Q○"
+        isSignal := nq_bullishEng
+        isBearishSignal := false
+    else if signalName == "Q◇"
+        isSignal := nq_bullishHar
+        isBearishSignal := false
+    else if signalName == "Q▲"
+        isSignal := nq_wickBelow
+        isBearishSignal := false
+    else if signalName == "Q↑"
+        isSignal := nq_lowerWick
+        isBearishSignal := false
+    else if signalName == "Q◆◆"
+        isSignal := nq_bbHar
+        isBearishSignal := false
+    else if signalName == "Q◇◇"
+        isSignal := nq_bbullHar
+        isBearishSignal := true
+    else if signalName == "Q●×"
+        isSignal := nq_bearEngRej
+        isBearishSignal := false
+    else if signalName == "Q○×"
+        isSignal := nq_bullEngRej
+        isBearishSignal := true
+    else if signalName == "Q↑3"
+        isSignal := nq_lowerWick3
+        isBearishSignal := false
+    else if signalName == "Q↑4"
+        isSignal := nq_lowerWick4
+        isBearishSignal := false
+    else if signalName == "Q↓3"
+        isSignal := nq_upperWick3
+        isBearishSignal := true
+    else if signalName == "Q↓4"
+        isSignal := nq_upperWick4
+        isBearishSignal := true
+    
+    [isSignal, isBearishSignal]
+
+// ═══════════════════════════════════════════════════════════
+// エントリー&イグジットロジック
+// ═══════════════════════════════════════════════════════════
+
+// 日足シグナル検出（毎バーチェック - V1.1方式）
+[signalDetected, isBearish] = f_checkSignal(entrySignalType)
+
+// シグナル用の変数
+var bool signalFiredPrev = false
+var bool signalIsBearishPrev = false
+var float daily_high = na
+var float daily_low = na
+var float daily_open_saved = na
+var float daily_close = na
+var float daily_atr = na
+var bool ma_filter_passed_saved = false
+
+// 日足シグナル発生時の処理
+if signalDetected
+    // 日足のMA関係チェック（シグナルバー判定の場合）
+    dailyOpen = request.security(syminfo.tickerid, "D", open[1], lookahead=barmerge.lookahead_off)
+    dailyMa5 = request.security(syminfo.tickerid, "D", ta.sma(close, 5)[1], lookahead=barmerge.lookahead_off)
+    dailyMa25 = request.security(syminfo.tickerid, "D", ta.sma(close, 25)[1], lookahead=barmerge.lookahead_off)
+    maPattern = f_getMaPattern(dailyOpen, dailyMa5, dailyMa25)
+    
+    if maFilterTiming == "シグナルバー"
+        // シグナルバーで判定
+        ma_filter_passed_saved := not useMaFilter or maPattern == maFilterPattern
+    else
+        // エントリーバーで判定する場合
+        ma_filter_passed_saved := true
+    
+    // MA関係フィルターを通過した場合のみシグナルを記録
+    if ma_filter_passed_saved
+        signalFiredPrev := true
+        signalIsBearishPrev := isBearish
+        daily_high := request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+        daily_low := request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off)
+        daily_open_saved := dailyOpen
+        daily_close := request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off)
+        daily_atr := request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead=barmerge.lookahead_off)
+
+// エントリー判定
+var int entry_date = na
+var float entry_price = na
+var int entry_daily_time = na
+
+// 翌バーエントリー（V1.1方式）
+if signalFiredPrev and strategy.position_size == 0
+    
+    entryCondition = false
+    maCheckPassed = true  // MA関係チェック通過フラグ
+    
+    // エントリーバーでMA関係を判定する場合
+    if maFilterTiming == "エントリーバー" and useMaFilter
+        // 1時間足の始値とMAで判定
+        maPattern_entry = f_getMaPattern(open, ma5_1h, ma25_1h)
+        if maPattern_entry != maFilterPattern
+            maCheckPassed := false
+            // MA関係が合わない場合は次のバーへ
+    
+    // MA関係が問題ない場合のみエントリー方法による判定へ進む
+    if maCheckPassed
+        
+        if entryMethod == "次バー始値"
+            // 次バー始値でエントリー
+            entryCondition := true
+        
+        else if entryMethod == "指値A"
+            // 高値と実体上限の中間（売り）/ 安値と実体下限の中間（買い）
+            if signalIsBearishPrev
+                bodyTop = math.max(daily_open_saved, daily_close)
+                limitPrice = (daily_high + bodyTop) / 2
+                entryCondition := high >= limitPrice
+            else
+                bodyBottom = math.min(daily_open_saved, daily_close)
+                limitPrice = (daily_low + bodyBottom) / 2
+                entryCondition := low <= limitPrice
+        
+        else if entryMethod == "指値C"
+            // レンジ比率
+            dailyRange = daily_high - daily_low
+            if signalIsBearishPrev
+                limitPrice = daily_high - (dailyRange * rangePercent)
+                entryCondition := high >= limitPrice
+            else
+                limitPrice = daily_low + (dailyRange * rangePercent)
+                entryCondition := low <= limitPrice
+        
+        else if entryMethod == "指値E"
+            // ATR比率
+            if signalIsBearishPrev
+                limitPrice = daily_open_saved + (daily_atr * atrMultiplier)
+                entryCondition := high >= limitPrice
+            else
+                limitPrice = daily_open_saved - (daily_atr * atrMultiplier)
+                entryCondition := low <= limitPrice
+        
+        else if entryMethod == "フィボナッチ"
+            // フィボナッチリトレースメント
+            fiboRange = daily_high - daily_low
+            fibo382 = signalIsBearishPrev ? daily_low + (fiboRange * 0.382) : daily_high - (fiboRange * 0.382)
+            fibo500 = signalIsBearishPrev ? daily_low + (fiboRange * 0.500) : daily_high - (fiboRange * 0.500)
+            fibo618 = signalIsBearishPrev ? daily_low + (fiboRange * 0.618) : daily_high - (fiboRange * 0.618)
+            
+            targetFibo = fiboLevel == "38.2%" ? fibo382 : fiboLevel == "50%" ? fibo500 : fibo618
+            
+            if signalIsBearishPrev
+                // 売り: リトレースメント到達 + 陰線確定
+                entryCondition := high >= targetFibo and close < open
+            else
+                // 買い: リトレースメント到達 + 陽線確定
+                entryCondition := low <= targetFibo and close > open
+        
+        else if entryMethod == "MA1H"
+            // 1時間足MAタッチ
+            targetMA = maTypeForEntry == "5MA" ? ma5_1h : ma25_1h
+            if signalIsBearishPrev
+                entryCondition := high >= targetMA and close < open
+            else
+                entryCondition := low <= targetMA and close > open
+        
+        else if entryMethod == "MAD"
+            // 日足MAタッチ
+            targetMA = maTypeForEntry == "5MA" ? ma5_daily : ma25_daily
+            if signalIsBearishPrev
+                entryCondition := high >= targetMA and close < open
+            else
+                entryCondition := low <= targetMA and close > open
+    
+    // エントリー実行
+    if entryCondition
+        if signalIsBearishPrev
+            strategy.entry("Short", strategy.short, qty=1)
+        else
+            strategy.entry("Long", strategy.long, qty=1)
+        
+        entry_date := dayofmonth(time)
+        entry_price := close
+        // エントリー時の日足タイムスタンプを記録
+        daily_time_at_entry = request.security(syminfo.tickerid, "D", time, lookahead=barmerge.lookahead_off)
+        entry_daily_time := int(daily_time_at_entry)
+        signalFiredPrev := false
+
+// 決済ロジック（日足ベース - 新バー検出方式）
+if strategy.position_size != 0 and not na(entry_daily_time)
+    // 現在の日足タイムスタンプを取得
+    current_daily_time_value = request.security(syminfo.tickerid, "D", time, lookahead=barmerge.lookahead_off)
+    current_daily_time = int(current_daily_time_value)
+    
+    // 日足の新バー検出
+    daily_time_changed_exit = ta.change(current_daily_time_value) != 0
+    
+    // エントリー日からの経過日数を計算
+    // 86400000 = 1日のミリ秒数
+    days_diff = math.round((current_daily_time - entry_daily_time) / 86400000)
+    
+    exitBarsDelay = exitType == "当日終値" ? 0 : exitType == "翌日終値" ? 1 : 2
+    
+    // 日足の新バーが出現し、規定の日数が経過したら決済
+    if daily_time_changed_exit and days_diff >= exitBarsDelay
+        if strategy.position_size > 0
+            strategy.close("Long")
+        else
+            strategy.close("Short")
+        entry_date := na
+        entry_price := na
+        entry_daily_time := na
+
+// ═══════════════════════════════════════════════════════════
+// 表示
+// ═══════════════════════════════════════════════════════════
+if showSignals and signalDetected and ma_filter_passed_saved
+    maPatternText = ""
+    if useMaFilter
+        dailyOpen_display = request.security(syminfo.tickerid, "D", open[1], lookahead=barmerge.lookahead_off)
+        dailyMa5_display = request.security(syminfo.tickerid, "D", ta.sma(close, 5)[1], lookahead=barmerge.lookahead_off)
+        dailyMa25_display = request.security(syminfo.tickerid, "D", ta.sma(close, 25)[1], lookahead=barmerge.lookahead_off)
+        maPattern_display = f_getMaPattern(dailyOpen_display, dailyMa5_display, dailyMa25_display)
+        maPatternText := "\n" + maPattern_display
+        if maFilterTiming == "エントリーバー"
+            maPatternText := maPatternText + "\n(次バーでMA判定)"
+    
+    label.new(bar_index, isBearish ? high : low, 
+              entrySignalType + maPatternText, 
+              style=isBearish ? label.style_label_down : label.style_label_up,
+              color=isBearish ? color.new(color.red, 20) : color.new(color.green, 20),
+              textcolor=color.white, size=size.small)
+
+if showEntryExit and strategy.position_size != 0 and not na(entry_price)
+    if bar_index == 0 or strategy.position_size[1] == 0
+        label.new(bar_index, strategy.position_size > 0 ? low : high, 
+                  "📍Entry\n" + str.tostring(entry_price, "#.#"),
+                  style=strategy.position_size > 0 ? label.style_label_up : label.style_label_down,
+                  color=strategy.position_size > 0 ? color.new(color.blue, 30) : color.new(color.orange, 30),
+                  textcolor=color.white, size=size.small)
+
+bgcolor(close > ma5_1h ? color.new(color.green, 95) : color.new(color.red, 95), title="5MA(1H)との位置")
+
+// ═══════════════════════════════════════════════════════════
+// パフォーマンス表示
+// ═══════════════════════════════════════════════════════════
+var table perfTable = table.new(position.bottom_right, 2, 8, border_width=1, border_color=color.gray)
+
+if barstate.islast
+    table.cell(perfTable, 0, 0, "項目", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 0, "値", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    
+    table.cell(perfTable, 0, 1, "純利益", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 1, str.tostring(strategy.netprofit, "#,###"), 
+               text_color=strategy.netprofit > 0 ? color.lime : color.red, text_size=size.small)
+    
+    table.cell(perfTable, 0, 2, "総取引数", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+    
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0
+    table.cell(perfTable, 0, 3, "勝率", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(winRate, "#.#") + "%", text_color=color.white, text_size=size.small)
+    
+    table.cell(perfTable, 0, 4, "PF", text_color=color.white, text_size=size.small)
+    pf = strategy.grossloss != 0 ? math.abs(strategy.grossprofit / strategy.grossloss) : 0
+    table.cell(perfTable, 1, 4, str.tostring(pf, "#.##"), text_color=color.white, text_size=size.small)
+    
+    table.cell(perfTable, 0, 5, "最大DD", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(strategy.max_drawdown, "#,###"), text_color=color.red, text_size=size.small)
+    
+    table.cell(perfTable, 0, 6, "平均利益", text_color=color.white, text_size=size.small)
+    avgWin = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : 0
+    table.cell(perfTable, 1, 6, str.tostring(avgWin, "#,###"), text_color=color.lime, text_size=size.small)
+    
+    table.cell(perfTable, 0, 7, "平均損失", text_color=color.white, text_size=size.small)
+    avgLoss = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : 0
+    table.cell(perfTable, 1, 7, str.tostring(avgLoss, "#,###"), text_color=color.red, text_size=size.small)
